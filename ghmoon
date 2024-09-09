@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+
+import argparse
+import getpass
+import json
+import os
+import socket
+import subprocess
+import sys
+import traceback
+import yaml
+
+try:
+    DEFAULT_REPORT=open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.sh")).read()
+except:
+    DEFAULT_REPORT=None
+
+context = None
+config = None
+repos = {}
+tsp = None
+
+class GH:
+    def __init__(self, path=None, repo="{owner}/{repo}"):
+        self.path, self.repo = path, repo
+
+    def exec(self, *args, **kwargs):
+        args = list(args)
+
+        args[0] = ["gh"] + args[0]
+
+        if self.path and "cwd" not in kwargs:
+            kwargs["cwd"] = self.path
+
+        if "check" not in kwargs:
+            kwargs["check"] = True
+
+        return subprocess.run(*args, **kwargs)
+
+    def api(self, endpoint, data={}, method=None):
+        if not method:
+            method = "POST" if data else "GET"
+
+        fields = (("--field", f"{key}={val}") for key, val in data.items())
+        opts = [e for pair in fields for e in pair]
+        opts += ["--method", method]
+
+        result = self.exec(["api", endpoint] + opts, stdout=subprocess.PIPE)
+        return json.loads(result.stdout)
+
+    def gist(self, contents, name="README.md"):
+        proc = self.exec(["gist", "create", "-f", name, "-"], text=True,
+                         input=contents, stdout=subprocess.PIPE)
+        return proc.stdout
+
+
+class Git:
+    def __init__(self, path, origin):
+        self.path, self.origin = path, origin
+
+    def exec(self, *args, **kwargs):
+        args = list(args)
+
+        args[0] = ["git"] + args[0]
+
+        if self.path and "cwd" not in kwargs:
+            kwargs["cwd"] = self.path
+
+        if "check" not in kwargs:
+            kwargs["check"] = True
+
+        return subprocess.run(*args, **kwargs)
+
+    def fetch(self):
+        if not os.path.exists(self.path):
+            os.makedirs(self.path)
+            self.exec(["clone", "--recurse-submodules", "-j8", self.origin, "."])
+        else:
+            self.exec(["fetch", "--recurse-submodules"])
+
+class GHArtifact:
+    def __init__(self, repo, data):
+        self.repo, self.data = repo, data
+        self.sha = self.data["workflow_run"]["head_sha"]
+        self.br = self.data["workflow_run"]["head_branch"]
+
+    def is_new(self, context):
+        statuses = self.repo.api(f"commits/{self.sha}/statuses")
+        return not any(map(lambda status: status["context"] == context, statuses))
+
+class GHCommit:
+    def __init__(self, repo, sha):
+        self.repo, self.sha = repo, sha
+        self.hook_env = os.environ | {
+            "CONTEXT": context,
+            "REPO": str(repo),
+            "SHA": sha,
+        }
+
+        for hook in ("report-deploy-summary", "report-test-summary"):
+            script = self.repo.config.get("hooks", {}).get(hook)
+            if script:
+                self.hook_env |= { hook.upper().replace("-", "_"): script }
+
+    def exists(self):
+        return self.repo.git.exec(["cat-file", "-e", self.sha],
+                                  stderr=subprocess.DEVNULL, check=False).returncode == 0
+
+    def status(self, state, desc, url=None):
+        urlstr = f" ({url})" if url else ""
+        print(f"{self.repo}@{self.sha:.8s}: [{state}] {desc}{urlstr}")
+
+        fields = { "context": context, "state": state, "description": desc }
+        if url:
+            fields |= { "target_url": url}
+        self.repo.api(f"statuses/{self.sha}", fields)
+
+    def checkout(self):
+        self.repo.git.exec(["checkout", "--recurse-submodules", self.sha])
+#DEBUG        self.repo.git.exec(["clean", "-ffdx"])
+
+    def exec_hook(self, hook, interactive=True, default=None, **kwargs):
+        kwargs["env"] = kwargs.get("env", {}) | self.hook_env
+
+        if interactive:
+            log=None
+        else:
+            logpath = f"{self.repo.path}/{hook}-{self.sha}.log"
+            self.hook_env |= { f"{hook.upper()}_LOG": logpath }
+            log = open(logpath, "w")
+
+        script = self.repo.config.get("hooks", {}).get(hook)
+        if not script:
+            if not default:
+                assert script, f"Required hook \"{hook}\" not found for {self.repo}"
+            script = default
+
+        proc = subprocess.run(["/bin/sh"], input=script, cwd=self.repo.git.path,
+                              check=False, text=True,
+                              stdout=log, stderr=subprocess.STDOUT, **kwargs)
+
+        self.hook_env |= { f"{hook.upper()}_EXITCODE": str(proc.returncode) }
+        if proc.returncode != 0:
+            raise Exception(f"{hook} of {self.repo}@{self.sha} failed with code {proc.returncode}")
+
+    def process(self, interactive=True):
+        def local_status(state, desc, url=None):
+            urlstr = f" ({url})" if url else ""
+            print(f"{self.repo}@{self.sha:.8s}: [{state}] {desc}{urlstr}")
+
+        status = local_status if interactive else self.status
+
+        status("pending", "Deploying Artifact")
+        try:
+            state = "error"
+            self.exec_hook("deploy", interactive)
+            status("pending", "Running tests")
+            state = "failure"
+            self.exec_hook("test", interactive)
+            state = "success"
+        except Exception as e:
+            sys.stderr.write(f"EXCEPTION: {str(e)}\n")
+            traceback.print_exc()
+            pass
+
+        gist = None
+        try:
+            self.exec_hook("report", interactive, default=DEFAULT_REPORT)
+            if interactive:
+                gist = None
+            else:
+                gistname = f"{context}-{str(self.repo)}@{self.sha:.8s}.md".replace("/", "-")
+                gist = self.repo.gh.gist(open(f"{self.repo.path}/report-{self.sha}.log").read(), gistname)
+
+        except Exception as e:
+            sys.stderr.write(f"EXCEPTION: {str(e)}\n")
+            traceback.print_exc()
+            pass
+
+        try:
+            self.exec_hook("cleanup", interactive, default="true")
+        except Exception as e:
+            sys.stderr.write(f"EXCEPTION: {str(e)}\n")
+            traceback.print_exc()
+            pass
+
+        if state == "error":
+            status("error", "Failed to deploy artifact", gist)
+        elif state == "failure":
+            status("failure", "Test failed", gist)
+        elif state == "success":
+            status("success", "Test passed", gist)
+        else:
+            status("error", "Internal error", gist)
+
+        return state == "success"
+
+
+class GHRepo:
+    def __init__(self, repo: str, config: dict):
+        self.repo, self.config = repo, config
+        self.path = config.get("worktree", os.path.expanduser(f"~/.ghmoon/{repo}"))
+        self.git = Git(f"{self.path}/git", f"https://github.com/{self.repo}.git") # TODO pass token to private repos
+        self.gh = GH(f"{self.path}/git", self.repo)
+
+    def __str__(self):
+        return self.repo
+
+    def api(self, endpoint, data={}, method=None):
+        return self.gh.api(f"/repos/{self.repo}/{endpoint}", data, method)
+
+    def get_matching_artifacts(self):
+        arts = self.api("actions/artifacts").get("artifacts", [])
+
+        jq = subprocess.run(["jq", "[.[] | select(" + self.config["match"] + ")]"],
+                            input=json.dumps(arts), stdout=subprocess.PIPE,
+                            text=True, check=True)
+        matches = json.loads(jq.stdout)
+        return [GHArtifact(self, data) for data in matches]
+
+    def get_new_artifacts(self):
+        # Get available artifacts from GitHub
+        matching = self.get_matching_artifacts()
+        # Filter out those that are already queued locally (cheap)
+        matching = filter(lambda a: not tsp.is_queued(a), matching)
+        # Filter out those that have already been processed by a
+        # previous incarnation of this ghmoon (expensive)
+        matching = filter(lambda a: a.is_new(context), matching)
+
+        return matching
+
+    def enqueue(self, publish=False):
+        for new in self.get_new_artifacts():
+            tsp.enqueue(new, publish)
+
+    def process(self, sha, interactive=True):
+        c = GHCommit(self, sha)
+        if not c.exists():
+            self.git.fetch()
+
+        c.checkout()
+        return c.process(interactive)
+
+
+class TaskSpooler:
+    def __init__(self, config):
+        self.execname = config.get("execname", "tsp")
+        self.env = {
+            "TS_SOCKET": config.get("socket", os.path.expanduser("~/.ghmoon/tsp-sock")),
+            "TS_SAVELIST": config.get("savelist", os.path.expanduser("~/.ghmoon/tsp-queue")),
+        }
+        self.start()
+
+    def exec(self, *args, **kwargs):
+        args = list(args)
+        args[0] = [self.execname] + args[0]
+
+        kwargs["env"] = kwargs.get("env", {}) | self.env
+
+        return subprocess.run(*args, **kwargs)
+
+    def start(self):
+        self.exec([], stdout=subprocess.PIPE, check=True)
+
+    def jobs(self):
+        proc = self.exec(["-l"], stdout=subprocess.PIPE, check=True, text=True)
+        return proc.stdout.splitlines()[1:]
+
+    def is_queued(self, artifact):
+        return any(map(lambda job: artifact.sha in job, self.jobs()))
+
+    def enqueue(self, artifact, publish=False):
+        if self.is_queued(artifact):
+            return
+
+        argv = ["-L", artifact.br, os.path.abspath(__file__), "process"]
+        if publish:
+            argv += ["-p"]
+        argv += [str(artifact.repo), artifact.sha]
+
+        self.exec(argv)
+
+
+def init(args):
+    global context
+    global config
+    global repos
+    global tsp
+
+    cfgfile = args.config
+    if not cfgfile:
+        for src in (os.path.expanduser("~/.ghmoon/config.yaml"),
+                    "/etc/ghmoon/config.yaml"):
+            try:
+                cfgfile = open(src, "r")
+                break
+            except:
+                pass
+
+        assert cfgfile, "No config specified, an no default found"
+
+    config = yaml.load(cfgfile, Loader=yaml.FullLoader)
+    context = config.get("context", f"{getpass.getuser()}@{socket.gethostname()}")
+
+    for repo in config.get("repos"):
+        repos[repo] = GHRepo(repo, config["repos"][repo])
+
+    tsp = TaskSpooler(config.get("task-spooler", {}))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(prog="ghmoon")
+    parser.add_argument("-f", "--config-file",
+                        type=argparse.FileType("r"), dest="config")
+
+    sps = parser.add_subparsers(dest="cmd")
+
+    enq_sp = sps.add_parser("enqueue")
+    enq_sp.add_argument("-p", "--publish", action="store_true")
+    enq_sp.add_argument("repo", nargs="?", type=str)
+
+    pro_sp = sps.add_parser("process")
+    pro_sp.add_argument("-p", "--publish", action="store_true")
+    pro_sp.add_argument("repo", type=str)
+    pro_sp.add_argument("sha", type=str)
+
+    tsp_sp = sps.add_parser("tsp")
+    tsp_sp.add_argument("tsp_args", nargs='*', type=str)
+
+    args = parser.parse_args()
+    init(args)
+
+    if "repo" in args and args.repo:
+        assert args.repo in repos, f"\"{args.repo}\" is not a repo we orbit"
+
+    if False:
+        pass
+    elif args.cmd == "enqueue":
+        rs = [args.repo] if args.repo else repos.values()
+        for repo in rs:
+            repo.enqueue(args.publish)
+    elif args.cmd == "process":
+        sys.exit(0 if repos[args.repo].process(args.sha, not args.publish) else 1)
+    elif args.cmd == "tsp":
+        tsp.exec(args.tsp_args)
