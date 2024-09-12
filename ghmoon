@@ -7,18 +7,22 @@ import os
 import socket
 import subprocess
 import sys
+import time
 import traceback
 import yaml
 
 try:
-    DEFAULT_REPORT=open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.sh")).read()
+    DEFAULT_REPORT=open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "report.sh")).read()
 except:
+    sys.stderr.write("WARNING: No default report script found\n")
     DEFAULT_REPORT=None
+
+MIN_ENQUEUE_INTERVAL = 5
 
 context = None
 config = None
 repos = {}
-tsp = None
+wq = None
 
 class GH:
     def __init__(self, path=None, repo="{owner}/{repo}"):
@@ -57,6 +61,8 @@ class GH:
 class Git:
     def __init__(self, path, origin):
         self.path, self.origin = path, origin
+        if not os.path.exists(self.path):
+            self.fetch()
 
     def exec(self, *args, **kwargs):
         args = list(args)
@@ -117,7 +123,6 @@ class GHCommit:
 
     def checkout(self):
         self.repo.git.exec(["checkout", "--recurse-submodules", self.sha])
-#DEBUG        self.repo.git.exec(["clean", "-ffdx"])
 
     def exec_hook(self, hook, interactive=True, default=None, **kwargs):
         kwargs["env"] = kwargs.get("env", {}) | self.hook_env
@@ -200,6 +205,7 @@ class GHRepo:
     def __init__(self, repo: str, config: dict):
         self.repo, self.config = repo, config
         self.path = config.get("worktree", os.path.expanduser(f"~/.ghmoon/{repo}"))
+        os.makedirs(self.path, exist_ok=True)
         self.git = Git(f"{self.path}/git", f"https://github.com/{self.repo}.git") # TODO pass token to private repos
         self.gh = GH(f"{self.path}/git", self.repo)
 
@@ -218,74 +224,188 @@ class GHRepo:
         matches = json.loads(jq.stdout)
         return [GHArtifact(self, data) for data in matches]
 
-    def get_new_artifacts(self):
-        # Get available artifacts from GitHub
-        matching = self.get_matching_artifacts()
-        # Filter out those that are already queued locally (cheap)
-        matching = filter(lambda a: not tsp.is_queued(a), matching)
-        # Filter out those that have already been processed by a
-        # previous incarnation of this ghmoon (expensive)
-        matching = filter(lambda a: a.is_new(context), matching)
-
-        return matching
-
-    def enqueue(self, publish=False):
-        for new in self.get_new_artifacts():
-            tsp.enqueue(new, publish)
-
     def process(self, sha, interactive=True):
         c = GHCommit(self, sha)
         if not c.exists():
             self.git.fetch()
 
         c.checkout()
+
+        if self.config.get("git", {}).get("clean", True):
+            self.git.exec(["clean", "-ffdx"])
+
         return c.process(interactive)
 
 
-class TaskSpooler:
-    def __init__(self, config):
-        self.execname = config.get("execname", "tsp")
-        self.env = {
-            "TS_SOCKET": config.get("socket", os.path.expanduser("~/.ghmoon/tsp-sock")),
-            "TS_SAVELIST": config.get("savelist", os.path.expanduser("~/.ghmoon/tsp-queue")),
+class WorkQueue:
+    def __init__(self, path, manage=False, publish=False):
+        self.publish = publish
+        self.paths = {
+            "todo": os.path.join(path, "todo"),
+            "doing": os.path.join(path, "doing"),
+            "done": os.path.join(path, "done"),
         }
-        self.start()
 
-    def exec(self, *args, **kwargs):
-        args = list(args)
-        args[0] = [self.execname] + args[0]
+        for path in self.paths.values():
+            os.makedirs(path, exist_ok=True)
 
-        kwargs["env"] = kwargs.get("env", {}) | self.env
+        if manage:
+            for job in os.listdir(self.paths["doing"]):
+                sys.stderr.write(f"Rescheduling unfinished job {job}\n")
+                os.rename(os.path.join(self.paths["doing"], job),
+                          os.path.join(self.paths["todo"], job))
 
-        return subprocess.run(*args, **kwargs)
+    def _job_paths(self, name):
+        return {
+            state: os.path.join(self.paths[state], f"{name}.json")
+            for state in self.paths.keys()
+        }
 
-    def start(self):
-        self.exec([], stdout=subprocess.PIPE, check=True)
+    def is_known(self, name):
+        paths = self._job_paths(name)
+        return any(map(os.path.exists, paths.values()))
 
-    def jobs(self):
-        proc = self.exec(["-l"], stdout=subprocess.PIPE, check=True, text=True)
-        return proc.stdout.splitlines()[1:]
+    def _enqueue(self, name, data):
+        data |= { "name": name }
+        paths = self._job_paths(name)
 
-    def is_queued(self, artifact):
-        return any(map(lambda job: artifact.sha in job, self.jobs()))
+        try:
+            fd = os.open(paths["todo"], os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            sys.stderr.write(f"Ignoring {name}: already queued\n")
+            return False
 
-    def enqueue(self, artifact, publish=False):
-        if self.is_queued(artifact):
+        if os.path.exists(paths["doing"]):
+            os.close(fd)
+            os.remove(paths["todo"])
+            sys.stderr.write(f"Ignoring {name}: already in progress\n")
+            return False
+        elif os.path.exists(paths["done"]):
+            os.close(fd)
+            os.remove(paths["todo"])
+            sys.stderr.write(f"Ignoring {name}: already processed\n")
+            return False
+
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data))
+
+        sys.stderr.write(f"Queued {name}\n")
+        return True
+
+    def _enqueue_repo(self, repo):
+        sys.stderr.write(f"Polling {str(repo)}\n")
+
+        for artifact in repo.get_matching_artifacts():
+            name = f"{str(repo).replace('/', '-')}-{artifact.sha}"
+            if self.is_known(name):
+                continue
+
+            self._enqueue(name, {
+                "type": "process",
+                "repo": str(repo),
+                "sha": artifact.sha,
+
+                "artifact": artifact.data,
+            })
+
+    def enqueue(self):
+        global repos
+
+        for repo in repos.values():
+            self._enqueue_repo(repo)
+
+    def listdir(self, path):
+        out = subprocess.check_output(["ls", "-rt", "--time=birth", path], text=True)
+        return out.splitlines()
+
+    def _dequeue(self):
+        assert not os.listdir(self.paths["doing"]), "Another job is alredy in progress"
+
+        abspaths = [os.path.join(self.paths["todo"], job)
+                    for job in self.listdir(self.paths["todo"])]
+        for abspath in abspaths:
+            try:
+                with open(abspath) as f:
+                    job = json.loads(f.read())
+            except:
+                sys.stderr.write(f"Skipping {abspath}: Not a JSON document\n")
+                traceback.print_exc()
+                continue
+
+            if not job.get("name"):
+                sys.stderr.write(f"Skipping {abspath}: Malformed job (no name)\n")
+                continue
+            elif not job.get("type"):
+                sys.stderr.write(f"Skipping {abspath}: Malformed job (no type)\n")
+                continue
+            elif job["type"] not in ("process"):
+                sys.stderr.write(f"Skipping {abspath}: Unsupported type {job['type']}\n")
+                continue
+
+            return job
+
+        return None
+
+    def _process_job(self, job):
+        name = job["name"]
+        paths = self._job_paths(name)
+
+        if not ("repo" in job and "sha" in job):
+            sys.stderr.write(f"Skipping {name}: Malformed process job\n")
+            os.rename(paths["todo"], paths["done"])
+            return
+        if not job["repo"] in repos:
+            sys.stderr.write(f"Skipping {name}: Unknown repo {job['repo']}\n")
+            os.rename(paths["todo"], paths["done"])
             return
 
-        argv = ["-L", artifact.br, os.path.abspath(__file__), "process"]
-        if publish:
-            argv += ["-p"]
-        argv += [str(artifact.repo), artifact.sha]
+        try:
+            os.rename(paths["todo"], paths["doing"])
+        except:
+            sys.stderr.write(f"Skipping {name}: Job disappeared\n")
+            return
 
-        self.exec(argv)
+        try:
+            sys.stderr.write(f"Processing {name}\n")
+            repos[job["repo"]].process(job["sha"], not self.publish)
+            sys.stderr.write(f"Processed {name}\n")
+        except Exception as e:
+            sys.stderr.write(f"Aborting {abspath}: {str(e)}\n")
+            traceback.print_exc()
+
+        os.rename(paths["doing"], paths["done"])
+        return
+
+    def process_next(self):
+        job = self._dequeue()
+        if not job:
+            return False
+
+        if job["type"] == "process":
+            self._process_job(job)
+
+        return True
+
+    def daemon(self):
+        while True:
+            self.enqueue()
+
+            t0 = time.time()
+            while self.process_next():
+                pass
+            t = time.time() - t0
+
+            # If the queue is empty, or if something goes wrong, make
+            # sure we rate-limit the polling of new artifacts.
+            if t < MIN_ENQUEUE_INTERVAL:
+                time.sleep(MIN_ENQUEUE_INTERVAL - t)
 
 
 def init(args):
     global context
     global config
     global repos
-    global tsp
+    global wq
 
     cfgfile = args.config
     if not cfgfile:
@@ -305,7 +425,9 @@ def init(args):
     for repo in config.get("repos"):
         repos[repo] = GHRepo(repo, config["repos"][repo])
 
-    tsp = TaskSpooler(config.get("task-spooler", {}))
+    wq = WorkQueue(os.path.expanduser(f"~/.ghmoon/workqueue"),
+                   "cmd" in args and args.cmd == "daemon",
+                   "publish" in args and args.publish)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="ghmoon")
@@ -314,17 +436,13 @@ if __name__ == "__main__":
 
     sps = parser.add_subparsers(dest="cmd")
 
-    enq_sp = sps.add_parser("enqueue")
-    enq_sp.add_argument("-p", "--publish", action="store_true")
-    enq_sp.add_argument("repo", nargs="?", type=str)
+    dae_sp = sps.add_parser("daemon")
+    dae_sp.add_argument("-p", "--publish", action="store_true")
 
     pro_sp = sps.add_parser("process")
     pro_sp.add_argument("-p", "--publish", action="store_true")
     pro_sp.add_argument("repo", type=str)
     pro_sp.add_argument("sha", type=str)
-
-    tsp_sp = sps.add_parser("tsp")
-    tsp_sp.add_argument("tsp_args", nargs='*', type=str)
 
     args = parser.parse_args()
     init(args)
@@ -334,11 +452,7 @@ if __name__ == "__main__":
 
     if False:
         pass
-    elif args.cmd == "enqueue":
-        rs = [args.repo] if args.repo else repos.values()
-        for repo in rs:
-            repo.enqueue(args.publish)
+    elif args.cmd == "daemon":
+        wq.daemon()
     elif args.cmd == "process":
         sys.exit(0 if repos[args.repo].process(args.sha, not args.publish) else 1)
-    elif args.cmd == "tsp":
-        tsp.exec(args.tsp_args)
