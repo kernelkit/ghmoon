@@ -19,14 +19,19 @@ except:
 
 MIN_ENQUEUE_INTERVAL = 5
 
+gistgh = None
 context = None
 config = None
 repos = {}
 wq = None
 
 class GH:
-    def __init__(self, path=None, repo="{owner}/{repo}"):
+    def __init__(self, repo="{owner}/{repo}", path=None, token=None):
         self.path, self.repo = path, repo
+
+        self.env = os.environ.copy()
+        if token:
+            self.env["GH_TOKEN"] = token
 
     def exec(self, *args, **kwargs):
         args = list(args)
@@ -38,6 +43,8 @@ class GH:
 
         if "check" not in kwargs:
             kwargs["check"] = True
+
+        kwargs["env"] = self.env | kwargs.get("env", {})
 
         return subprocess.run(*args, **kwargs)
 
@@ -174,8 +181,9 @@ class GHCommit:
             if interactive:
                 gist = None
             else:
+                global gistgh
                 gistname = f"{context}-{str(self.repo)}@{self.sha:.8s}.md".replace("/", "-")
-                gist = self.repo.gh.gist(open(f"{self.repo.path}/report-{self.sha}.log").read(), gistname)
+                gist = gistgh.gist(open(f"{self.repo.path}/report-{self.sha}.log").read(), gistname)
 
         except Exception as e:
             sys.stderr.write(f"EXCEPTION: {str(e)}\n")
@@ -207,7 +215,7 @@ class GHRepo:
         self.path = config.get("worktree", os.path.expanduser(f"~/.ghmoon/{repo}"))
         os.makedirs(self.path, exist_ok=True)
         self.git = Git(f"{self.path}/git", f"https://github.com/{self.repo}.git") # TODO pass token to private repos
-        self.gh = GH(f"{self.path}/git", self.repo)
+        self.gh = GH(repo=self.repo, path=f"{self.path}/git", token=config.get("token"))
 
     def __str__(self):
         return self.repo
@@ -402,6 +410,7 @@ class WorkQueue:
 
 
 def init(args):
+    global gistgh
     global context
     global config
     global repos
@@ -421,6 +430,8 @@ def init(args):
 
     config = yaml.load(cfgfile, Loader=yaml.FullLoader)
     context = config.get("context", f"{getpass.getuser()}@{socket.gethostname()}")
+
+    gistgh = GH(token=config.get("gist", {}).get("token"))
 
     for repo in config.get("repos"):
         repos[repo] = GHRepo(repo, config["repos"][repo])
