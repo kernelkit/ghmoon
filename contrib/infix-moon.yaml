@@ -1,0 +1,21 @@
+# Small example config showing how to orbit a ghmoon around
+# kernelkit/infix, running tests on x86_64 artifacts.
+repos:
+  kernelkit/infix:
+    match: >-
+      .workflow_run.head_repository_id == .workflow_run.repository_id
+      and
+      .name == "artifact-x86_64"
+
+    hooks:
+      deploy: |
+        [ -x utils/gh-dl-artifact.sh ] || { echo "Image too old" >&2; exit 1; }
+        ./utils/gh-dl-artifact.sh $SHA
+
+      test: |
+        make O=x-gh-dl-$(echo $SHA | head -c8)-x86_64 test
+
+      report-test-summary: |
+        tail -n+2 test/.log/last/result-gh.md
+        echo
+        echo **Exitcode**: $TEST_EXITCODE
