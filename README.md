@@ -42,20 +42,35 @@ Usage
 -----
 
 ```
-  ghmoon enqueue [--publish] [<repo>]
-    Look for new matching artifacts in <repo>, or all repos if not specified, to
-    test, and queue processing of the corresponding commit in this moon's task
-    spooler. If --publish is specified, processing commands are enqueued with
-    the publish flag set.
+  ghmoon daemon [--publish]
+    Continuously monitor repos for new matching artifacts, queue and process
+	them. If --publish is specified, report progress via GitHub commit
+	statuses, and publish a Gist of the full report.
 
   ghmoon process [--publish] <repo> <commit>
-    Checkout <commit> from <repo>, then run the deploy, test, and report hooks
-    for <repo>. If --publish is specified, report progress via GitHub commit
-    statuses, and publish a Gist of the full report.
+    Manually checkout <commit> from <repo>, then run the deploy, test, and
+	report hooks for <repo>. If --publish is specified, report progress via
+	GitHub commit statuses, and publish a Gist of the full report.
 
-  ghmoon tsp -- [<task-spooler-args>]
-    Run raw task spooler commands for the instance used by this moon.
+	NOTE: Ensure that no active daemon clashes with your manual processing job.
 ```
+
+
+Installation
+------------
+
+To install `ghmoon` to be run by the current user's `systemd`
+instance, run the provided install script:
+
+    ./contrib/user-install.sh
+
+Follow the instructions after the script exits.
+
+If you are installing for a user that is not always logged in to the
+system, you probably want to make sure that their `systemd` instance
+is always started at system boot:
+
+    sudo loginctl enable-linger <your-ghmoon-user>
 
 
 Configuration
