@@ -17,7 +17,7 @@ except:
     sys.stderr.write("WARNING: No default report script found\n")
     DEFAULT_REPORT=None
 
-MIN_ENQUEUE_INTERVAL = 5
+MIN_ENQUEUE_INTERVAL = 30
 
 gistgh = None
 context = None
