@@ -450,6 +450,8 @@ if __name__ == "__main__":
     dae_sp = sps.add_parser("daemon")
     dae_sp.add_argument("-p", "--publish", action="store_true")
 
+    enq_sp = sps.add_parser("enqueue")
+
     pro_sp = sps.add_parser("process")
     pro_sp.add_argument("-p", "--publish", action="store_true")
     pro_sp.add_argument("repo", type=str)
@@ -465,5 +467,7 @@ if __name__ == "__main__":
         pass
     elif args.cmd == "daemon":
         wq.daemon()
+    elif args.cmd == "enqueue":
+        wq.enqueue()
     elif args.cmd == "process":
         sys.exit(0 if repos[args.repo].process(args.sha, not args.publish) else 1)
