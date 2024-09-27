@@ -110,6 +110,10 @@ class GHCommit:
             "SHA": sha,
         }
 
+        token = repo.config.get("token")
+        if token:
+            self.hook_env["GH_TOKEN"] = token
+
         for hook in ("report-deploy-summary", "report-test-summary"):
             script = self.repo.config.get("hooks", {}).get(hook)
             if script:
