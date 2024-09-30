@@ -133,7 +133,7 @@ class GHCommit:
         self.repo.api(f"statuses/{self.sha}", fields)
 
     def checkout(self):
-        self.repo.git.exec(["checkout", "--recurse-submodules", self.sha])
+        self.repo.git.exec(["checkout", "--force", "--recurse-submodules", self.sha])
 
     def exec_hook(self, hook, interactive=True, default=None, **kwargs):
         kwargs["env"] = kwargs.get("env", {}) | self.hook_env
