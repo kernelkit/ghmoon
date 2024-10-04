@@ -241,6 +241,10 @@ class GHRepo:
         if not c.exists():
             self.git.fetch()
 
+        if not c.exists():
+            sys.stderr.write(f"Ignoring non-existing commit {sha} from {str(self)}\n")
+            return False
+
         c.checkout()
 
         if self.config.get("git", {}).get("clean", True):
