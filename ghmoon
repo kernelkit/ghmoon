@@ -382,7 +382,7 @@ class WorkQueue:
             repos[job["repo"]].process(job["sha"], not self.publish)
             sys.stderr.write(f"Processed {name}\n")
         except Exception as e:
-            sys.stderr.write(f"Aborting {abspath}: {str(e)}\n")
+            sys.stderr.write(f"Aborting {name}: {str(e)}\n")
             traceback.print_exc()
 
         os.rename(paths["doing"], paths["done"])
