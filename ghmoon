@@ -218,8 +218,10 @@ class GHRepo:
         self.repo, self.config = repo, config
         self.path = config.get("worktree", os.path.expanduser(f"~/.ghmoon/{repo}"))
         os.makedirs(self.path, exist_ok=True)
-        self.git = Git(f"{self.path}/git", f"https://github.com/{self.repo}.git") # TODO pass token to private repos
-        self.gh = GH(repo=self.repo, path=f"{self.path}/git", token=config.get("token"))
+        token=config.get("token")
+        tokenstr=f"{token}@" if token else ""
+        self.git = Git(f"{self.path}/git", f"https://{tokenstr}github.com/{self.repo}.git")
+        self.gh = GH(repo=self.repo, path=f"{self.path}/git", token=token)
 
     def __str__(self):
         return self.repo
