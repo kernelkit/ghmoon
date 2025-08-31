@@ -94,6 +94,7 @@ class Git:
 class GHArtifact:
     def __init__(self, repo, data):
         self.repo, self.data = repo, data
+        self.name = self.data["name"]
         self.sha = self.data["workflow_run"]["head_sha"]
         self.br = self.data["workflow_run"]["head_branch"]
 
@@ -102,12 +103,13 @@ class GHArtifact:
         return not any(map(lambda status: status["context"] == context, statuses))
 
 class GHCommit:
-    def __init__(self, repo, sha):
+    def __init__(self, repo, sha, nm=None):
         self.repo, self.sha = repo, sha
         self.hook_env = os.environ | {
             "CONTEXT": context,
             "REPO": str(repo),
             "SHA": sha,
+            "NAME": nm,
         }
 
         token = repo.config.get("token")
@@ -238,8 +240,8 @@ class GHRepo:
         matches = json.loads(jq.stdout)
         return [GHArtifact(self, data) for data in matches]
 
-    def process(self, sha, interactive=True):
-        c = GHCommit(self, sha)
+    def process(self, sha, nm, interactive=True):
+        c = GHCommit(self, sha, nm)
         if not c.exists():
             self.git.fetch()
 
@@ -322,6 +324,7 @@ class WorkQueue:
                 "type": "process",
                 "repo": str(repo),
                 "sha": artifact.sha,
+                "name": artifact.name,
 
                 "artifact": artifact.data,
             })
@@ -385,7 +388,7 @@ class WorkQueue:
 
         try:
             sys.stderr.write(f"Processing {name}\n")
-            repos[job["repo"]].process(job["sha"], not self.publish)
+            repos[job["repo"]].process(job["sha"], job["name"], not self.publish)
             sys.stderr.write(f"Processed {name}\n")
         except Exception as e:
             sys.stderr.write(f"Aborting {name}: {str(e)}\n")
