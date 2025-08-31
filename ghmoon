@@ -103,7 +103,7 @@ class GHArtifact:
         return not any(map(lambda status: status["context"] == context, statuses))
 
 class GHCommit:
-    def __init__(self, repo, sha, nm=None):
+    def __init__(self, repo, sha, nm):
         self.repo, self.sha = repo, sha
         self.hook_env = os.environ | {
             "CONTEXT": context,
@@ -239,6 +239,14 @@ class GHRepo:
                             text=True, check=True)
         matches = json.loads(jq.stdout)
         return [GHArtifact(self, data) for data in matches]
+
+    def get_artifacts_by_sha(self, sha):
+        names = []
+        artifacts = self.get_matching_artifacts()
+        for artifact in artifacts:
+            if artifact.sha == sha:
+                names.append(artifact.name)
+        return names
 
     def process(self, sha, nm, interactive=True):
         c = GHCommit(self, sha, nm)
@@ -483,4 +491,13 @@ if __name__ == "__main__":
     elif args.cmd == "enqueue":
         wq.enqueue()
     elif args.cmd == "process":
-        sys.exit(0 if repos[args.repo].process(args.sha, not args.publish) else 1)
+        names = repos[args.repo].get_artifacts_by_sha(args.sha)
+        if not names:
+            repo = f"{args.repo}@{args.sha}"
+            sys.stderr.write(f"No matching artifacts found for {repo}\n")
+            sys.exit(1)
+
+        for nm in names:
+            if not repos[args.repo].process(args.sha, nm, not args.publish):
+                sys.exit(1)
+        sys.exit(0)
