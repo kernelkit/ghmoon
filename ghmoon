@@ -94,6 +94,7 @@ class Git:
 class GHArtifact:
     def __init__(self, repo, data):
         self.repo, self.data = repo, data
+        self.name = self.data["name"]
         self.sha = self.data["workflow_run"]["head_sha"]
         self.br = self.data["workflow_run"]["head_branch"]
 
@@ -102,12 +103,13 @@ class GHArtifact:
         return not any(map(lambda status: status["context"] == context, statuses))
 
 class GHCommit:
-    def __init__(self, repo, sha):
+    def __init__(self, repo, sha, nm):
         self.repo, self.sha = repo, sha
         self.hook_env = os.environ | {
             "CONTEXT": context,
             "REPO": str(repo),
             "SHA": sha,
+            "NAME": nm,
         }
 
         token = repo.config.get("token")
@@ -238,8 +240,16 @@ class GHRepo:
         matches = json.loads(jq.stdout)
         return [GHArtifact(self, data) for data in matches]
 
-    def process(self, sha, interactive=True):
-        c = GHCommit(self, sha)
+    def get_artifacts_by_sha(self, sha):
+        names = []
+        artifacts = self.get_matching_artifacts()
+        for artifact in artifacts:
+            if artifact.sha == sha:
+                names.append(artifact.name)
+        return names
+
+    def process(self, sha, nm, interactive=True):
+        c = GHCommit(self, sha, nm)
         if not c.exists():
             self.git.fetch()
 
@@ -322,6 +332,7 @@ class WorkQueue:
                 "type": "process",
                 "repo": str(repo),
                 "sha": artifact.sha,
+                "name": artifact.name,
 
                 "artifact": artifact.data,
             })
@@ -385,7 +396,7 @@ class WorkQueue:
 
         try:
             sys.stderr.write(f"Processing {name}\n")
-            repos[job["repo"]].process(job["sha"], not self.publish)
+            repos[job["repo"]].process(job["sha"], job["name"], not self.publish)
             sys.stderr.write(f"Processed {name}\n")
         except Exception as e:
             sys.stderr.write(f"Aborting {name}: {str(e)}\n")
@@ -480,4 +491,13 @@ if __name__ == "__main__":
     elif args.cmd == "enqueue":
         wq.enqueue()
     elif args.cmd == "process":
-        sys.exit(0 if repos[args.repo].process(args.sha, not args.publish) else 1)
+        names = repos[args.repo].get_artifacts_by_sha(args.sha)
+        if not names:
+            repo = f"{args.repo}@{args.sha}"
+            sys.stderr.write(f"No matching artifacts found for {repo}\n")
+            sys.exit(1)
+
+        for nm in names:
+            if not repos[args.repo].process(args.sha, nm, not args.publish):
+                sys.exit(1)
+        sys.exit(0)
