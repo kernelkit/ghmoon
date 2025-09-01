@@ -168,7 +168,7 @@ class GHCommit:
 
         env = {
             "ARTIFACT": artifact["name"],
-            "ARTIFACT_JSON": artifact,
+            "ARTIFACT_JSON": json.dumps(artifact),
         }
 
         status("pending", "Deploying Artifact")
