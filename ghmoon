@@ -159,20 +159,25 @@ class GHCommit:
         if proc.returncode != 0:
             raise Exception(f"{hook} of {self.repo}@{self.sha} failed with code {proc.returncode}")
 
-    def process(self, interactive=True):
+    def process(self, artifact, interactive=True):
         def local_status(state, desc, url=None):
             urlstr = f" ({url})" if url else ""
             print(f"{self.repo}@{self.sha:.8s}: [{state}] {desc}{urlstr}")
 
         status = local_status if interactive else self.status
 
+        env = {
+            "ARTIFACT": artifact["name"],
+            "ARTIFACT_JSON": artifact,
+        }
+
         status("pending", "Deploying Artifact")
         try:
             state = "error"
-            self.exec_hook("deploy", interactive)
+            self.exec_hook("deploy", interactive, env=env)
             status("pending", "Running tests")
             state = "failure"
-            self.exec_hook("test", interactive)
+            self.exec_hook("test", interactive, env=env)
             state = "success"
         except Exception as e:
             sys.stderr.write(f"EXCEPTION: {str(e)}\n")
@@ -181,7 +186,7 @@ class GHCommit:
 
         gist = None
         try:
-            self.exec_hook("report", interactive, default=DEFAULT_REPORT)
+            self.exec_hook("report", interactive, env=env, default=DEFAULT_REPORT)
             if interactive:
                 gist = None
             else:
@@ -195,7 +200,7 @@ class GHCommit:
             pass
 
         try:
-            self.exec_hook("cleanup", interactive, default="true")
+            self.exec_hook("cleanup", interactive, env=env, default="true")
         except Exception as e:
             sys.stderr.write(f"EXCEPTION: {str(e)}\n")
             traceback.print_exc()
@@ -238,7 +243,13 @@ class GHRepo:
         matches = json.loads(jq.stdout)
         return [GHArtifact(self, data) for data in matches]
 
-    def process(self, sha, interactive=True):
+    def process_standalone(self, sha, interactive=True):
+        for artifact in self.get_matching_artifacts():
+            self.process({ "sha": sha, "artifact": artifact }, interactive)
+
+    def process(self, job, interactive=True):
+        sha = job["sha"]
+
         c = GHCommit(self, sha)
         if not c.exists():
             self.git.fetch()
@@ -252,7 +263,7 @@ class GHRepo:
         if self.config.get("git", {}).get("clean", True):
             self.git.exec(["clean", "-ffdx"])
 
-        return c.process(interactive)
+        return c.process(job["artifact"], interactive)
 
 
 class WorkQueue:
@@ -385,7 +396,7 @@ class WorkQueue:
 
         try:
             sys.stderr.write(f"Processing {name}\n")
-            repos[job["repo"]].process(job["sha"], not self.publish)
+            repos[job["repo"]].process(job, not self.publish)
             sys.stderr.write(f"Processed {name}\n")
         except Exception as e:
             sys.stderr.write(f"Aborting {name}: {str(e)}\n")
@@ -480,4 +491,4 @@ if __name__ == "__main__":
     elif args.cmd == "enqueue":
         wq.enqueue()
     elif args.cmd == "process":
-        sys.exit(0 if repos[args.repo].process(args.sha, not args.publish) else 1)
+        sys.exit(0 if repos[args.repo].process_standalone(args.sha, not args.publish) else 1)
