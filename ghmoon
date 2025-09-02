@@ -245,7 +245,10 @@ class GHRepo:
 
     def process_standalone(self, sha, interactive=True):
         for artifact in self.get_matching_artifacts():
-            self.process({ "sha": sha, "artifact": artifact }, interactive)
+            if artifact.sha != sha:
+                continue
+
+            self.process({ "sha": sha, "artifact": artifact.data }, interactive)
 
     def process(self, job, interactive=True):
         sha = job["sha"]
