@@ -3,14 +3,14 @@ set -e
 SHA8=$(echo $SHA | head -c8)
 URL=https://github.com/$REPO
 
-# Path to ANSI to GFM converter (relative to this script)
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ANSI2GFM="$SCRIPT_DIR/ansi2gfm.py"
+# Path to ANSI to GFM converter
+# GHMOON_PATH is set by the ghmoon Python script
+ANSI2GFM="${GHMOON_PATH:-.}/ansi2gfm.py"
 
 # Function to process logs (strip ANSI or convert to GFM)
 process_log() {
-    if [ -x "$ANSI2GFM" ]; then
-        "$ANSI2GFM"
+    if [ -f "$ANSI2GFM" ]; then
+        python3 "$ANSI2GFM"
     else
         # Fallback: strip ANSI codes if converter not available
         sed 's/\x1b\[[0-9;]*m//g'

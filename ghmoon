@@ -11,8 +11,10 @@ import time
 import traceback
 import yaml
 
+GHMOON_PATH = os.path.dirname(os.path.realpath(__file__))
+
 try:
-    DEFAULT_REPORT=open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "report.sh")).read()
+    DEFAULT_REPORT=open(os.path.join(GHMOON_PATH, "report.sh")).read()
 except:
     sys.stderr.write("WARNING: No default report script found\n")
     DEFAULT_REPORT=None
@@ -105,6 +107,7 @@ class GHCommit:
     def __init__(self, repo, sha):
         self.repo, self.sha = repo, sha
         self.hook_env = os.environ | {
+            "GHMOON_PATH": GHMOON_PATH,
             "CONTEXT": context,
             "REPO": str(repo),
             "SHA": sha,
