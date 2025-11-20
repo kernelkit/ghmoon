@@ -131,11 +131,20 @@ def convert_ansi_to_gfm(text):
                     next_line = lines[i + 1].strip()
                     # Check if next line has content and no ANSI codes at start
                     if next_line and not next_line.startswith('\x1b['):
-                        # Next line is the heading content
-                        line = '<h2>' + next_line + '</h2>'
-                        clean_lines.append(line)
-                        i += 2  # Skip both this line and next line
-                        continue
+                        # Check if it starts with a letter (could be skip/fail marker)
+                        # Skip markers in summary: "s 0076 Container..."
+                        if next_line and next_line[0].isalpha() and len(next_line) > 2 and next_line[1] == ' ':
+                            # This is likely a skip/fail marker in summary, treat as strikethrough
+                            line = '<del>' + next_line + '</del>'
+                            clean_lines.append(line)
+                            i += 2  # Skip both this line and next line
+                            continue
+                        else:
+                            # Next line is a heading
+                            line = '<h2>' + next_line + '</h2>'
+                            clean_lines.append(line)
+                            i += 2  # Skip both this line and next line
+                            continue
 
                 # No content on next line, skip this empty line
                 line = ''
@@ -231,21 +240,28 @@ def convert_ansi_to_gfm(text):
         line = re.sub(r'\x1b\[[0-9;]*m', '', line)
 
         # Auto-close any tags still open at end of line
-        # This handles cases where reset code is on next line
+        # But ONLY if next line doesn't start with a reset code
         final_open_tags = get_open_tags(line)
         if final_open_tags:
-            closing = ''
-            if 'b' in final_open_tags and 'mark' in final_open_tags:
-                closing = '</b></mark>'
-            elif 'del' in final_open_tags:
-                closing = '</del>'
-            elif 'b' in final_open_tags:
-                closing = '</b>'
-            elif 'h3' in final_open_tags:
-                closing = '</h3>'
-            elif 'mark' in final_open_tags:
-                closing = '</mark>'
-            line += closing
+            # Check if next line starts with reset code
+            next_line_has_reset = False
+            if i + 1 < len(lines):
+                next_line_has_reset = lines[i + 1].lstrip().startswith('\x1b[0m')
+
+            # Only auto-close if next line won't close them
+            if not next_line_has_reset:
+                closing = ''
+                if 'b' in final_open_tags and 'mark' in final_open_tags:
+                    closing = '</b></mark>'
+                elif 'del' in final_open_tags:
+                    closing = '</del>'
+                elif 'b' in final_open_tags:
+                    closing = '</b>'
+                elif 'h3' in final_open_tags:
+                    closing = '</h3>'
+                elif 'mark' in final_open_tags:
+                    closing = '</mark>'
+                line += closing
 
         clean_lines.append(line)
         i += 1
