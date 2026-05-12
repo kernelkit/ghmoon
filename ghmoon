@@ -289,6 +289,7 @@ class WorkQueue:
             "doing": os.path.join(path, "doing"),
             "done": os.path.join(path, "done"),
         }
+        self.pause_file = os.path.join(path, "paused")
 
         for path in self.paths.values():
             os.makedirs(path, exist_ok=True)
@@ -421,6 +422,11 @@ class WorkQueue:
         return
 
     def process_next(self):
+        if os.path.exists(self.pause_file):
+            if os.listdir(self.paths["todo"]):
+                sys.stderr.write("Skipping todo, work is paused\n")
+            return False
+
         job = self._dequeue()
         if not job:
             return False
