@@ -304,13 +304,14 @@ class WorkQueue:
                 os.rename(os.path.join(self.paths["doing"], job),
                           os.path.join(self.paths["todo"], job))
 
-    def write_result(self, name, state, gist=None, report_log=None, error=None):
+    def write_result(self, name, state, gist=None, report_log=None, error=None, heading=None):
         result = {
             "state": state,
             "gist": gist,
             "report_log": report_log,
             "finished_at": time.time(),
             "error": error,
+            "heading": heading,
         }
         path = os.path.join(self.result_path, f"{name}.json")
         tmp = path + ".tmp"
@@ -367,6 +368,7 @@ class WorkQueue:
                 "type": "process",
                 "repo": str(repo),
                 "sha": artifact.sha,
+                "heading": repo.api(f"commits/{artifact.sha}")["commit"]["message"].splitlines()[0],
 
                 "artifact": artifact.data,
             })
@@ -447,7 +449,8 @@ class WorkQueue:
             if os.path.exists(candidate):
                 report_log = candidate
 
-        self.write_result(name, state, gist=gist, report_log=report_log, error=error)
+        self.write_result(name, state, gist=gist, report_log=report_log, error=error,
+                          heading=job.get("heading"))
 
         os.rename(paths["doing"], paths["done"])
         return
@@ -555,7 +558,8 @@ if __name__ == "__main__":
         repo_obj = repos[args.repo]
         state, gist = repo_obj.process_standalone(args.sha, not args.publish)
         name = f"{args.repo.replace('/', '-')}-{args.sha}"
+        heading = repo_obj.api(f"commits/{args.sha}")["commit"]["message"].splitlines()[0]
         candidate = f"{repo_obj.path}/report-{args.sha}.log"
         report_log = candidate if os.path.exists(candidate) else None
-        wq.write_result(name, state, gist=gist, report_log=report_log)
+        wq.write_result(name, state, gist=gist, report_log=report_log, heading=heading)
         sys.exit(0 if state == "success" else 1)
