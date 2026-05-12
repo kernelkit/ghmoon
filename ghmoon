@@ -227,7 +227,7 @@ class GHCommit:
         else:
             status("error", "Internal error", gist)
 
-        return state == "success"
+        return state, gist
 
 
 class GHRepo:
@@ -260,7 +260,10 @@ class GHRepo:
             if artifact.sha != sha:
                 continue
 
-            self.process({ "sha": sha, "artifact": artifact.data }, interactive)
+            return self.process({ "sha": sha, "artifact": artifact.data }, interactive)
+
+        sys.stderr.write(f"No matching artifact for {sha} in {str(self)}\n")
+        return "error", None
 
     def process(self, job, interactive=True):
         sha = job["sha"]
@@ -271,7 +274,7 @@ class GHRepo:
 
         if not c.exists():
             sys.stderr.write(f"Ignoring non-existing commit {sha} from {str(self)}\n")
-            return False
+            return "error", None
 
         c.checkout()
 
@@ -290,15 +293,30 @@ class WorkQueue:
             "done": os.path.join(path, "done"),
         }
         self.pause_file = os.path.join(path, "paused")
+        self.result_path = os.path.join(path, "result")
 
-        for path in self.paths.values():
-            os.makedirs(path, exist_ok=True)
+        for p in list(self.paths.values()) + [self.result_path]:
+            os.makedirs(p, exist_ok=True)
 
         if manage:
             for job in os.listdir(self.paths["doing"]):
                 sys.stderr.write(f"Rescheduling unfinished job {job}\n")
                 os.rename(os.path.join(self.paths["doing"], job),
                           os.path.join(self.paths["todo"], job))
+
+    def write_result(self, name, state, gist=None, report_log=None, error=None):
+        result = {
+            "state": state,
+            "gist": gist,
+            "report_log": report_log,
+            "finished_at": time.time(),
+            "error": error,
+        }
+        path = os.path.join(self.result_path, f"{name}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(result))
+        os.replace(tmp, path)
 
     def _job_paths(self, name):
         return {
@@ -397,10 +415,12 @@ class WorkQueue:
 
         if not ("repo" in job and "sha" in job):
             sys.stderr.write(f"Skipping {name}: Malformed process job\n")
+            self.write_result(name, "error", error="Malformed process job")
             os.rename(paths["todo"], paths["done"])
             return
         if not job["repo"] in repos:
             sys.stderr.write(f"Skipping {name}: Unknown repo {job['repo']}\n")
+            self.write_result(name, "error", error=f"Unknown repo {job['repo']}")
             os.rename(paths["todo"], paths["done"])
             return
 
@@ -410,13 +430,24 @@ class WorkQueue:
             sys.stderr.write(f"Skipping {name}: Job disappeared\n")
             return
 
+        state, gist, error = "error", None, None
         try:
             sys.stderr.write(f"Processing {name}\n")
-            repos[job["repo"]].process(job, not self.publish)
+            state, gist = repos[job["repo"]].process(job, not self.publish)
             sys.stderr.write(f"Processed {name}\n")
         except Exception as e:
             sys.stderr.write(f"Aborting {name}: {str(e)}\n")
             traceback.print_exc()
+            error = str(e)
+
+        repo_obj = repos.get(job["repo"])
+        report_log = None
+        if repo_obj:
+            candidate = f"{repo_obj.path}/report-{job['sha']}.log"
+            if os.path.exists(candidate):
+                report_log = candidate
+
+        self.write_result(name, state, gist=gist, report_log=report_log, error=error)
 
         os.rename(paths["doing"], paths["done"])
         return
@@ -521,4 +552,10 @@ if __name__ == "__main__":
     elif args.cmd == "enqueue":
         wq.enqueue()
     elif args.cmd == "process":
-        sys.exit(0 if repos[args.repo].process_standalone(args.sha, not args.publish) else 1)
+        repo_obj = repos[args.repo]
+        state, gist = repo_obj.process_standalone(args.sha, not args.publish)
+        name = f"{args.repo.replace('/', '-')}-{args.sha}"
+        candidate = f"{repo_obj.path}/report-{args.sha}.log"
+        report_log = candidate if os.path.exists(candidate) else None
+        wq.write_result(name, state, gist=gist, report_log=report_log)
+        sys.exit(0 if state == "success" else 1)
