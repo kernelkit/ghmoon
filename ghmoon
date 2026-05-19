@@ -289,6 +289,7 @@ class WorkQueue:
         self.publish = publish
         self.paths = {
             "todo": os.path.join(path, "todo"),
+            "forced": os.path.join(path, "todo", "forced"),
             "doing": os.path.join(path, "doing"),
             "done": os.path.join(path, "done"),
         }
@@ -349,6 +350,11 @@ class WorkQueue:
             os.remove(paths["todo"])
             sys.stderr.write(f"Ignoring {name}: already processed\n")
             return False
+        elif os.path.exists(paths["forced"]):
+            os.close(fd)
+            os.remove(paths["todo"])
+            sys.stderr.write(f"Ignoring {name}: already forced\n")
+            return False
 
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(data))
@@ -383,11 +389,11 @@ class WorkQueue:
         out = subprocess.check_output(["ls", "-rt", "--time=birth", path], text=True)
         return out.splitlines()
 
-    def _dequeue(self):
+    def _dequeue(self, lane):
         assert not os.listdir(self.paths["doing"]), "Another job is alredy in progress"
 
-        abspaths = [os.path.join(self.paths["todo"], job)
-                    for job in self.listdir(self.paths["todo"])]
+        entries = [e for e in self.listdir(self.paths[lane]) if e.endswith(".json")]
+        abspaths = [os.path.join(self.paths[lane], e) for e in entries]
         for abspath in abspaths:
             try:
                 with open(abspath) as f:
@@ -411,23 +417,24 @@ class WorkQueue:
 
         return None
 
-    def _process_job(self, job):
+    def _process_job(self, job, src_lane):
         name = job["name"]
         paths = self._job_paths(name)
+        src = paths[src_lane]
 
         if not ("repo" in job and "sha" in job):
             sys.stderr.write(f"Skipping {name}: Malformed process job\n")
             self.write_result(name, "error", error="Malformed process job")
-            os.rename(paths["todo"], paths["done"])
+            os.rename(src, paths["done"])
             return
         if not job["repo"] in repos:
             sys.stderr.write(f"Skipping {name}: Unknown repo {job['repo']}\n")
             self.write_result(name, "error", error=f"Unknown repo {job['repo']}")
-            os.rename(paths["todo"], paths["done"])
+            os.rename(src, paths["done"])
             return
 
         try:
-            os.rename(paths["todo"], paths["doing"])
+            os.rename(src, paths["doing"])
         except:
             sys.stderr.write(f"Skipping {name}: Job disappeared\n")
             return
@@ -456,17 +463,20 @@ class WorkQueue:
         return
 
     def process_next(self):
-        if os.path.exists(self.pause_file):
-            if os.listdir(self.paths["todo"]):
+        paused = os.path.exists(self.pause_file)
+
+        src_lane = "forced"
+        job = self._dequeue(src_lane)
+        if not job and not paused:
+            src_lane = "todo"
+            job = self._dequeue(src_lane)
+        if not job:
+            if paused and any(e.endswith(".json") for e in os.listdir(self.paths["todo"])):
                 sys.stderr.write("Skipping todo, work is paused\n")
             return False
 
-        job = self._dequeue()
-        if not job:
-            return False
-
         if job["type"] == "process":
-            self._process_job(job)
+            self._process_job(job, src_lane)
 
         return True
 
