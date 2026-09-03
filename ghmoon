@@ -21,6 +21,9 @@ except:
 
 MIN_ENQUEUE_INTERVAL = 30
 
+# How long an abort hook gets to stop the job.
+ABORT_GRACE = 120
+
 def deep_merge(base, overlay):
     """Recursively merge overlay into base. Dicts merge key-wise; everything else is replaced."""
     if isinstance(base, dict) and isinstance(overlay, dict):
@@ -29,6 +32,9 @@ def deep_merge(base, overlay):
             out[k] = deep_merge(base.get(k), v) if k in base else v
         return out
     return overlay
+
+class Aborted(Exception):
+    pass
 
 gistgh = None
 context = None
@@ -113,8 +119,8 @@ class GHArtifact:
         return not any(map(lambda status: status["context"] == context, statuses))
 
 class GHCommit:
-    def __init__(self, repo, sha):
-        self.repo, self.sha = repo, sha
+    def __init__(self, repo, sha, name=None):
+        self.repo, self.sha, self.name = repo, sha, name
         self.hook_env = os.environ | {
             "GHMOON_PATH": GHMOON_PATH,
             "CONTEXT": context,
@@ -130,6 +136,38 @@ class GHCommit:
             script = self.repo.config.get("hooks", {}).get(hook)
             if script:
                 self.hook_env |= { hook.upper().replace("-", "_"): script }
+
+    def try_abort(self, hook, env, proc):
+        """Consume an abort request, if there is one. Returns True if the job
+        actually stopped, if not, it simply carries on."""
+        if self.name is None:
+            return False    # not run from the workqueue, so nothing to abort
+        try:
+            os.remove(os.path.join(wq.abort_path, self.name))
+        except FileNotFoundError:
+            return False
+
+        script = self.repo.config.get("hooks", {}).get("abort")
+        if not script:
+            sys.stderr.write(f"Abort of {self.repo}@{self.sha} requested, "
+                             f"but the repo has no abort hook\n")
+            return False
+
+        sys.stderr.write(f"Aborting {hook} of {self.repo}@{self.sha}\n")
+        try:
+            subprocess.run(["/bin/sh"], input=script, cwd=self.repo.git.path,
+                           check=False, text=True, env=env | { "HOOK": hook },
+                           timeout=ABORT_GRACE)
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"Abort hook of {self.repo}@{self.sha} timed out\n")
+            return False
+
+        try:
+            proc.wait(timeout=ABORT_GRACE)
+            return True
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"Abort failed, {self.repo}@{self.sha} still running\n")
+            return False
 
     def exists(self):
         return self.repo.git.exec(["cat-file", "-e", self.sha],
@@ -163,11 +201,28 @@ class GHCommit:
                 assert script, f"Required hook \"{hook}\" not found for {self.repo}"
             script = default
 
-        proc = subprocess.run(["/bin/sh"], input=script, cwd=self.repo.git.path,
-                              check=False, text=True,
-                              stdout=log, stderr=subprocess.STDOUT, **kwargs)
+        proc = subprocess.Popen(["/bin/sh"], stdin=subprocess.PIPE,
+                                cwd=self.repo.git.path, text=True,
+                                stdout=log, stderr=subprocess.STDOUT, **kwargs)
+        proc.stdin.write(script)
+        proc.stdin.close()
+
+        aborted = False
+        try:
+            while not aborted:
+                try:
+                    proc.wait(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    aborted = self.try_abort(hook, kwargs["env"], proc)
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
 
         self.hook_env |= { f"{hook.upper()}_EXITCODE": str(proc.returncode) }
+        if aborted:
+            raise Aborted(f"{hook} of {self.repo}@{self.sha} aborted by user")
         if proc.returncode != 0:
             raise Exception(f"{hook} of {self.repo}@{self.sha} failed with code {proc.returncode}")
 
@@ -198,6 +253,9 @@ class GHCommit:
             state = "failure"
             self.exec_hook("test", interactive, env=env)
             state = "success"
+        except Aborted as e:
+            sys.stderr.write(f"ABORTED: {str(e)}\n")
+            state = "aborted"
         except Exception as e:
             sys.stderr.write(f"EXCEPTION: {str(e)}\n")
             traceback.print_exc()
@@ -227,6 +285,8 @@ class GHCommit:
 
         if state == "error":
             status("error", "Failed to deploy artifact", gist)
+        elif state == "aborted":
+            status("error", "Aborted by user", gist)
         elif state == "failure":
             status("failure", "Test failed", gist)
         elif state == "success":
@@ -275,7 +335,7 @@ class GHRepo:
     def process(self, job, interactive=True):
         sha = job["sha"]
 
-        c = GHCommit(self, sha)
+        c = GHCommit(self, sha, job.get("name"))
         if not c.exists():
             self.git.fetch()
 
@@ -302,8 +362,9 @@ class WorkQueue:
         }
         self.pause_file = os.path.join(path, "paused")
         self.result_path = os.path.join(path, "result")
+        self.abort_path = os.path.join(path, "abort")
 
-        for p in list(self.paths.values()) + [self.result_path]:
+        for p in list(self.paths.values()) + [self.result_path, self.abort_path]:
             os.makedirs(p, exist_ok=True)
 
         if manage:
@@ -424,6 +485,12 @@ class WorkQueue:
 
         return None
 
+    def _clear_abort(self, name):
+        try:
+            os.remove(os.path.join(self.abort_path, name))
+        except FileNotFoundError:
+            pass
+
     def _process_job(self, job, src_lane):
         name = job["name"]
         paths = self._job_paths(name)
@@ -446,6 +513,9 @@ class WorkQueue:
             sys.stderr.write(f"Skipping {name}: Job disappeared\n")
             return
 
+        # An abort flag left over from a previous run must not apply to this one
+        self._clear_abort(name)
+
         state, gist, error = "error", None, None
         try:
             sys.stderr.write(f"Processing {name}\n")
@@ -455,6 +525,9 @@ class WorkQueue:
             sys.stderr.write(f"Aborting {name}: {str(e)}\n")
             traceback.print_exc()
             error = str(e)
+
+        if state == "aborted":
+            error = "Aborted by user"
 
         repo_obj = repos.get(job["repo"])
         report_log = None
@@ -466,6 +539,8 @@ class WorkQueue:
         self.write_result(name, state, gist=gist, report_log=report_log, error=error,
                           heading=job.get("heading"))
 
+        # Clear an abort request that arrived too late
+        self._clear_abort(name)
         os.rename(paths["doing"], paths["done"])
         return
 
