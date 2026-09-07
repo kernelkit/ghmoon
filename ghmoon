@@ -172,6 +172,13 @@ class GHCommit:
             raise Exception(f"{hook} of {self.repo}@{self.sha} failed with code {proc.returncode}")
 
     def process(self, artifact, interactive=True):
+        # Remove logs from previous runs of the same job
+        for hook in ("deploy", "test", "report", "cleanup"):
+            try:
+                os.remove(f"{self.repo.path}/{hook}-{self.sha}.log")
+            except FileNotFoundError:
+                pass
+
         def local_status(state, desc, url=None):
             urlstr = f" ({url})" if url else ""
             print(f"{self.repo}@{self.sha:.8s}: [{state}] {desc}{urlstr}")
