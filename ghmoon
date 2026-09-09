@@ -21,6 +21,9 @@ except:
 
 MIN_ENQUEUE_INTERVAL = 30
 
+# How long an abort hook gets to stop the job.
+ABORT_GRACE = 120
+
 def deep_merge(base, overlay):
     """Recursively merge overlay into base. Dicts merge key-wise; everything else is replaced."""
     if isinstance(base, dict) and isinstance(overlay, dict):
@@ -29,6 +32,9 @@ def deep_merge(base, overlay):
             out[k] = deep_merge(base.get(k), v) if k in base else v
         return out
     return overlay
+
+class Aborted(Exception):
+    pass
 
 gistgh = None
 context = None
@@ -113,8 +119,8 @@ class GHArtifact:
         return not any(map(lambda status: status["context"] == context, statuses))
 
 class GHCommit:
-    def __init__(self, repo, sha):
-        self.repo, self.sha = repo, sha
+    def __init__(self, repo, sha, name=None):
+        self.repo, self.sha, self.name = repo, sha, name
         self.hook_env = os.environ | {
             "GHMOON_PATH": GHMOON_PATH,
             "CONTEXT": context,
@@ -130,6 +136,38 @@ class GHCommit:
             script = self.repo.config.get("hooks", {}).get(hook)
             if script:
                 self.hook_env |= { hook.upper().replace("-", "_"): script }
+
+    def try_abort(self, hook, env, proc):
+        """Consume an abort request, if there is one. Returns True if the job
+        actually stopped, if not, it simply carries on."""
+        if self.name is None:
+            return False    # not run from the workqueue, so nothing to abort
+        try:
+            os.remove(os.path.join(wq.abort_path, self.name))
+        except FileNotFoundError:
+            return False
+
+        script = self.repo.config.get("hooks", {}).get("abort")
+        if not script:
+            sys.stderr.write(f"Abort of {self.repo}@{self.sha} requested, "
+                             f"but the repo has no abort hook\n")
+            return False
+
+        sys.stderr.write(f"Aborting {hook} of {self.repo}@{self.sha}\n")
+        try:
+            subprocess.run(["/bin/sh"], input=script, cwd=self.repo.git.path,
+                           check=False, text=True, env=env | { "HOOK": hook },
+                           timeout=ABORT_GRACE)
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"Abort hook of {self.repo}@{self.sha} timed out\n")
+            return False
+
+        try:
+            proc.wait(timeout=ABORT_GRACE)
+            return True
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"Abort failed, {self.repo}@{self.sha} still running\n")
+            return False
 
     def exists(self):
         return self.repo.git.exec(["cat-file", "-e", self.sha],
@@ -163,15 +201,39 @@ class GHCommit:
                 assert script, f"Required hook \"{hook}\" not found for {self.repo}"
             script = default
 
-        proc = subprocess.run(["/bin/sh"], input=script, cwd=self.repo.git.path,
-                              check=False, text=True,
-                              stdout=log, stderr=subprocess.STDOUT, **kwargs)
+        proc = subprocess.Popen(["/bin/sh"], stdin=subprocess.PIPE,
+                                cwd=self.repo.git.path, text=True,
+                                stdout=log, stderr=subprocess.STDOUT, **kwargs)
+        proc.stdin.write(script)
+        proc.stdin.close()
+
+        aborted = False
+        try:
+            while not aborted:
+                try:
+                    proc.wait(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    aborted = self.try_abort(hook, kwargs["env"], proc)
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
 
         self.hook_env |= { f"{hook.upper()}_EXITCODE": str(proc.returncode) }
+        if aborted:
+            raise Aborted(f"{hook} of {self.repo}@{self.sha} aborted by user")
         if proc.returncode != 0:
             raise Exception(f"{hook} of {self.repo}@{self.sha} failed with code {proc.returncode}")
 
     def process(self, artifact, interactive=True):
+        # Remove logs from previous runs of the same job
+        for hook in ("deploy", "test", "report", "cleanup"):
+            try:
+                os.remove(f"{self.repo.path}/{hook}-{self.sha}.log")
+            except FileNotFoundError:
+                pass
+
         def local_status(state, desc, url=None):
             urlstr = f" ({url})" if url else ""
             print(f"{self.repo}@{self.sha:.8s}: [{state}] {desc}{urlstr}")
@@ -191,6 +253,9 @@ class GHCommit:
             state = "failure"
             self.exec_hook("test", interactive, env=env)
             state = "success"
+        except Aborted as e:
+            sys.stderr.write(f"ABORTED: {str(e)}\n")
+            state = "aborted"
         except Exception as e:
             sys.stderr.write(f"EXCEPTION: {str(e)}\n")
             traceback.print_exc()
@@ -220,6 +285,8 @@ class GHCommit:
 
         if state == "error":
             status("error", "Failed to deploy artifact", gist)
+        elif state == "aborted":
+            status("error", "Aborted by user", gist)
         elif state == "failure":
             status("failure", "Test failed", gist)
         elif state == "success":
@@ -227,7 +294,7 @@ class GHCommit:
         else:
             status("error", "Internal error", gist)
 
-        return state == "success"
+        return state, gist
 
 
 class GHRepo:
@@ -260,18 +327,21 @@ class GHRepo:
             if artifact.sha != sha:
                 continue
 
-            self.process({ "sha": sha, "artifact": artifact.data }, interactive)
+            return self.process({ "sha": sha, "artifact": artifact.data }, interactive)
+
+        sys.stderr.write(f"No matching artifact for {sha} in {str(self)}\n")
+        return "error", None
 
     def process(self, job, interactive=True):
         sha = job["sha"]
 
-        c = GHCommit(self, sha)
+        c = GHCommit(self, sha, job.get("name"))
         if not c.exists():
             self.git.fetch()
 
         if not c.exists():
             sys.stderr.write(f"Ignoring non-existing commit {sha} from {str(self)}\n")
-            return False
+            return "error", None
 
         c.checkout()
 
@@ -286,18 +356,37 @@ class WorkQueue:
         self.publish = publish
         self.paths = {
             "todo": os.path.join(path, "todo"),
+            "forced": os.path.join(path, "todo", "forced"),
             "doing": os.path.join(path, "doing"),
             "done": os.path.join(path, "done"),
         }
+        self.pause_file = os.path.join(path, "paused")
+        self.result_path = os.path.join(path, "result")
+        self.abort_path = os.path.join(path, "abort")
 
-        for path in self.paths.values():
-            os.makedirs(path, exist_ok=True)
+        for p in list(self.paths.values()) + [self.result_path, self.abort_path]:
+            os.makedirs(p, exist_ok=True)
 
         if manage:
             for job in os.listdir(self.paths["doing"]):
                 sys.stderr.write(f"Rescheduling unfinished job {job}\n")
                 os.rename(os.path.join(self.paths["doing"], job),
                           os.path.join(self.paths["todo"], job))
+
+    def write_result(self, name, state, gist=None, report_log=None, error=None, heading=None):
+        result = {
+            "state": state,
+            "gist": gist,
+            "report_log": report_log,
+            "finished_at": time.time(),
+            "error": error,
+            "heading": heading,
+        }
+        path = os.path.join(self.result_path, f"{name}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(result))
+        os.replace(tmp, path)
 
     def _job_paths(self, name):
         return {
@@ -329,6 +418,11 @@ class WorkQueue:
             os.remove(paths["todo"])
             sys.stderr.write(f"Ignoring {name}: already processed\n")
             return False
+        elif os.path.exists(paths["forced"]):
+            os.close(fd)
+            os.remove(paths["todo"])
+            sys.stderr.write(f"Ignoring {name}: already forced\n")
+            return False
 
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(data))
@@ -348,6 +442,7 @@ class WorkQueue:
                 "type": "process",
                 "repo": str(repo),
                 "sha": artifact.sha,
+                "heading": repo.api(f"commits/{artifact.sha}")["commit"]["message"].splitlines()[0],
 
                 "artifact": artifact.data,
             })
@@ -362,11 +457,11 @@ class WorkQueue:
         out = subprocess.check_output(["ls", "-rt", "--time=birth", path], text=True)
         return out.splitlines()
 
-    def _dequeue(self):
+    def _dequeue(self, lane):
         assert not os.listdir(self.paths["doing"]), "Another job is alredy in progress"
 
-        abspaths = [os.path.join(self.paths["todo"], job)
-                    for job in self.listdir(self.paths["todo"])]
+        entries = [e for e in self.listdir(self.paths[lane]) if e.endswith(".json")]
+        abspaths = [os.path.join(self.paths[lane], e) for e in entries]
         for abspath in abspaths:
             try:
                 with open(abspath) as f:
@@ -390,43 +485,80 @@ class WorkQueue:
 
         return None
 
-    def _process_job(self, job):
+    def _clear_abort(self, name):
+        try:
+            os.remove(os.path.join(self.abort_path, name))
+        except FileNotFoundError:
+            pass
+
+    def _process_job(self, job, src_lane):
         name = job["name"]
         paths = self._job_paths(name)
+        src = paths[src_lane]
 
         if not ("repo" in job and "sha" in job):
             sys.stderr.write(f"Skipping {name}: Malformed process job\n")
-            os.rename(paths["todo"], paths["done"])
+            self.write_result(name, "error", error="Malformed process job")
+            os.rename(src, paths["done"])
             return
         if not job["repo"] in repos:
             sys.stderr.write(f"Skipping {name}: Unknown repo {job['repo']}\n")
-            os.rename(paths["todo"], paths["done"])
+            self.write_result(name, "error", error=f"Unknown repo {job['repo']}")
+            os.rename(src, paths["done"])
             return
 
         try:
-            os.rename(paths["todo"], paths["doing"])
+            os.rename(src, paths["doing"])
         except:
             sys.stderr.write(f"Skipping {name}: Job disappeared\n")
             return
 
+        # An abort flag left over from a previous run must not apply to this one
+        self._clear_abort(name)
+
+        state, gist, error = "error", None, None
         try:
             sys.stderr.write(f"Processing {name}\n")
-            repos[job["repo"]].process(job, not self.publish)
+            state, gist = repos[job["repo"]].process(job, not self.publish)
             sys.stderr.write(f"Processed {name}\n")
         except Exception as e:
             sys.stderr.write(f"Aborting {name}: {str(e)}\n")
             traceback.print_exc()
+            error = str(e)
 
+        if state == "aborted":
+            error = "Aborted by user"
+
+        repo_obj = repos.get(job["repo"])
+        report_log = None
+        if repo_obj:
+            candidate = f"{repo_obj.path}/report-{job['sha']}.log"
+            if os.path.exists(candidate):
+                report_log = candidate
+
+        self.write_result(name, state, gist=gist, report_log=report_log, error=error,
+                          heading=job.get("heading"))
+
+        # Clear an abort request that arrived too late
+        self._clear_abort(name)
         os.rename(paths["doing"], paths["done"])
         return
 
     def process_next(self):
-        job = self._dequeue()
+        paused = os.path.exists(self.pause_file)
+
+        src_lane = "forced"
+        job = self._dequeue(src_lane)
+        if not job and not paused:
+            src_lane = "todo"
+            job = self._dequeue(src_lane)
         if not job:
+            if paused and any(e.endswith(".json") for e in os.listdir(self.paths["todo"])):
+                sys.stderr.write("Skipping todo, work is paused\n")
             return False
 
         if job["type"] == "process":
-            self._process_job(job)
+            self._process_job(job, src_lane)
 
         return True
 
@@ -515,4 +647,11 @@ if __name__ == "__main__":
     elif args.cmd == "enqueue":
         wq.enqueue()
     elif args.cmd == "process":
-        sys.exit(0 if repos[args.repo].process_standalone(args.sha, not args.publish) else 1)
+        repo_obj = repos[args.repo]
+        state, gist = repo_obj.process_standalone(args.sha, not args.publish)
+        name = f"{args.repo.replace('/', '-')}-{args.sha}"
+        heading = repo_obj.api(f"commits/{args.sha}")["commit"]["message"].splitlines()[0]
+        candidate = f"{repo_obj.path}/report-{args.sha}.log"
+        report_log = candidate if os.path.exists(candidate) else None
+        wq.write_result(name, state, gist=gist, report_log=report_log, heading=heading)
+        sys.exit(0 if state == "success" else 1)
