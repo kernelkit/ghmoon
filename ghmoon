@@ -354,8 +354,9 @@ class GHRepo:
 
 
 class WorkQueue:
-    def __init__(self, path, manage=False, publish=False):
+    def __init__(self, path, manage=False, publish=False, delay=0):
         self.publish = publish
+        self.delay = delay
         self.paused_logged = False
         self.paths = {
             "todo": os.path.join(path, "todo"),
@@ -402,7 +403,7 @@ class WorkQueue:
         return any(map(os.path.exists, paths.values()))
 
     def _enqueue(self, name, data):
-        data |= { "name": name }
+        data |= { "name": name, "queued": time.time() }
         paths = self._job_paths(name)
 
         if os.path.exists(paths["doing"]):
@@ -482,6 +483,8 @@ class WorkQueue:
                 continue
             elif job["type"] not in ("process"):
                 sys.stderr.write(f"Skipping {abspath}: Unsupported type {job['type']}\n")
+                continue
+            elif lane == "todo" and time.time() - job.get("queued", 0) < self.delay:
                 continue
 
             return job
@@ -622,7 +625,8 @@ def init(args):
 
     wq = WorkQueue(os.path.expanduser(f"~/.ghmoon/workqueue"),
                    "cmd" in args and args.cmd == "daemon",
-                   "publish" in args and args.publish)
+                   "publish" in args and args.publish,
+                   config.get("delay", 0))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="ghmoon")

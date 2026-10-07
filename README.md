@@ -83,6 +83,10 @@ and runs the default test suite on it.
 # specified, it defaults to "user@hostname"
 context: Jacky's laptop rig
 
+# Seconds a new job waits in the queue before it can start, time to skip
+# it, e.g. from ghmoon-web.  Forced jobs start at once.  Defaults to 0.
+delay: 15
+
 repos:
   kernelkit/infix:
     # Each repo must define a jq(1) expression that is used to filter
