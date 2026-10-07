@@ -316,7 +316,7 @@ class GHRepo:
         return self.gh.api(f"/repos/{self.repo}/{endpoint}", data, method)
 
     def get_matching_artifacts(self):
-        arts = self.api("actions/artifacts").get("artifacts", [])
+        arts = self.api("actions/artifacts?per_page=100").get("artifacts", [])
 
         jq = subprocess.run(["jq", "[.[] | select(" + self.config["match"] + ")]"],
                             input=json.dumps(arts), stdout=subprocess.PIPE,
