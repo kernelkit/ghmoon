@@ -7,6 +7,8 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import yaml
@@ -19,7 +21,7 @@ except:
     sys.stderr.write("WARNING: No default report script found\n")
     DEFAULT_REPORT=None
 
-MIN_ENQUEUE_INTERVAL = 30
+POLL_INTERVAL = 30
 
 # How long an abort hook gets to stop the job.
 ABORT_GRACE = 120
@@ -314,7 +316,7 @@ class GHRepo:
         return self.gh.api(f"/repos/{self.repo}/{endpoint}", data, method)
 
     def get_matching_artifacts(self):
-        arts = self.api("actions/artifacts").get("artifacts", [])
+        arts = self.api("actions/artifacts?per_page=100").get("artifacts", [])
 
         jq = subprocess.run(["jq", "[.[] | select(" + self.config["match"] + ")]"],
                             input=json.dumps(arts), stdout=subprocess.PIPE,
@@ -352,8 +354,10 @@ class GHRepo:
 
 
 class WorkQueue:
-    def __init__(self, path, manage=False, publish=False):
+    def __init__(self, path, manage=False, publish=False, delay=0):
         self.publish = publish
+        self.delay = delay
+        self.paused_logged = False
         self.paths = {
             "todo": os.path.join(path, "todo"),
             "forced": os.path.join(path, "todo", "forced"),
@@ -399,33 +403,33 @@ class WorkQueue:
         return any(map(os.path.exists, paths.values()))
 
     def _enqueue(self, name, data):
-        data |= { "name": name }
+        data |= { "name": name, "queued": time.time() }
         paths = self._job_paths(name)
 
-        try:
-            fd = os.open(paths["todo"], os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            sys.stderr.write(f"Ignoring {name}: already queued\n")
-            return False
-
         if os.path.exists(paths["doing"]):
-            os.close(fd)
-            os.remove(paths["todo"])
             sys.stderr.write(f"Ignoring {name}: already in progress\n")
             return False
         elif os.path.exists(paths["done"]):
-            os.close(fd)
-            os.remove(paths["todo"])
             sys.stderr.write(f"Ignoring {name}: already processed\n")
             return False
         elif os.path.exists(paths["forced"]):
-            os.close(fd)
-            os.remove(paths["todo"])
             sys.stderr.write(f"Ignoring {name}: already forced\n")
             return False
 
+        # The daemon reads todo/ while we poll, so the job must appear
+        # complete: write it aside, then link it in, which fails if it is
+        # already queued
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(paths["todo"]), suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(data))
+        os.chmod(tmp, 0o644)
+        try:
+            os.link(tmp, paths["todo"])
+        except FileExistsError:
+            sys.stderr.write(f"Ignoring {name}: already queued\n")
+            return False
+        finally:
+            os.remove(tmp)
 
         sys.stderr.write(f"Queued {name}\n")
         return True
@@ -454,8 +458,8 @@ class WorkQueue:
             self._enqueue_repo(repo)
 
     def listdir(self, path):
-        out = subprocess.check_output(["ls", "-rt", "--time=birth", path], text=True)
-        return out.splitlines()
+        entries = sorted(os.scandir(path), key=lambda e: e.stat().st_mtime)
+        return [e.name for e in entries]
 
     def _dequeue(self, lane):
         assert not os.listdir(self.paths["doing"]), "Another job is alredy in progress"
@@ -479,6 +483,8 @@ class WorkQueue:
                 continue
             elif job["type"] not in ("process"):
                 sys.stderr.write(f"Skipping {abspath}: Unsupported type {job['type']}\n")
+                continue
+            elif lane == "todo" and time.time() - job.get("queued", 0) < self.delay:
                 continue
 
             return job
@@ -553,28 +559,35 @@ class WorkQueue:
             src_lane = "todo"
             job = self._dequeue(src_lane)
         if not job:
-            if paused and any(e.endswith(".json") for e in os.listdir(self.paths["todo"])):
+            if paused and not self.paused_logged and \
+               any(e.endswith(".json") for e in os.listdir(self.paths["todo"])):
                 sys.stderr.write("Skipping todo, work is paused\n")
+                self.paused_logged = True
             return False
+
+        self.paused_logged = paused
 
         if job["type"] == "process":
             self._process_job(job, src_lane)
 
         return True
 
-    def daemon(self):
+    def poll(self):
         while True:
-            self.enqueue()
+            try:
+                self.enqueue()
+            except Exception:
+                sys.stderr.write("Polling failed, retrying\n")
+                traceback.print_exc()
 
-            t0 = time.time()
-            while self.process_next():
-                pass
-            t = time.time() - t0
+            time.sleep(POLL_INTERVAL)
 
-            # If the queue is empty, or if something goes wrong, make
-            # sure we rate-limit the polling of new artifacts.
-            if t < MIN_ENQUEUE_INTERVAL:
-                time.sleep(MIN_ENQUEUE_INTERVAL - t)
+    def daemon(self):
+        threading.Thread(target=self.poll, daemon=True).start()
+
+        while True:
+            if not self.process_next():
+                time.sleep(1)
 
 
 def init(args):
@@ -612,7 +625,8 @@ def init(args):
 
     wq = WorkQueue(os.path.expanduser(f"~/.ghmoon/workqueue"),
                    "cmd" in args and args.cmd == "daemon",
-                   "publish" in args and args.publish)
+                   "publish" in args and args.publish,
+                   config.get("delay", 0))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="ghmoon")
