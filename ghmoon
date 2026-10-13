@@ -23,6 +23,10 @@ except:
 
 POLL_INTERVAL = 30
 
+# How often the progress hook is run while tests run, and how long it may take.
+PROGRESS_INTERVAL = 60
+PROGRESS_TIMEOUT = 10
+
 # How long an abort hook gets to stop the job.
 ABORT_GRACE = 120
 
@@ -187,7 +191,7 @@ class GHCommit:
     def checkout(self):
         self.repo.git.exec(["checkout", "--force", "--recurse-submodules", self.sha])
 
-    def exec_hook(self, hook, interactive=True, default=None, **kwargs):
+    def exec_hook(self, hook, interactive=True, default=None, tick=None, **kwargs):
         kwargs["env"] = kwargs.get("env", {}) | self.hook_env
 
         if interactive:
@@ -217,6 +221,8 @@ class GHCommit:
                     break
                 except subprocess.TimeoutExpired:
                     aborted = self.try_abort(hook, kwargs["env"], proc)
+                    if tick and not aborted:
+                        tick()
         except BaseException:
             proc.kill()
             proc.wait()
@@ -227,6 +233,36 @@ class GHCommit:
             raise Aborted(f"{hook} of {self.repo}@{self.sha} aborted by user")
         if proc.returncode != 0:
             raise Exception(f"{hook} of {self.repo}@{self.sha} failed with code {proc.returncode}")
+
+    def progress(self, status, env):
+        """Returns a function that, at most once every PROGRESS_INTERVAL, runs
+        the progress hook and posts its first line of output as the status."""
+        script = self.repo.config.get("hooks", {}).get("progress")
+        if not script:
+            return None
+
+        last_time, last_desc = time.time(), None
+
+        def tick():
+            nonlocal last_time, last_desc
+            now = time.time()
+            if now - last_time < PROGRESS_INTERVAL:
+                return
+            last_time = now
+
+            try:
+                proc = subprocess.run(["/bin/sh"], input=script, cwd=self.repo.git.path,
+                                      env=env | self.hook_env, text=True, check=False,
+                                      stdout=subprocess.PIPE, timeout=PROGRESS_TIMEOUT)
+                # GitHub refuses descriptions longer than 140 characters
+                desc = proc.stdout.lstrip().partition("\n")[0].rstrip()[:140]
+                if desc and desc != last_desc:
+                    last_desc = desc
+                    status("pending", desc)
+            except Exception as e:
+                sys.stderr.write(f"Progress of {self.repo}@{self.sha} failed: {str(e)}\n")
+
+        return tick
 
     def process(self, artifact, interactive=True):
         # Remove logs from previous runs of the same job
@@ -253,7 +289,8 @@ class GHCommit:
             self.exec_hook("deploy", interactive, env=env)
             status("pending", "Running tests")
             state = "failure"
-            self.exec_hook("test", interactive, env=env)
+            self.exec_hook("test", interactive, env=env,
+                           tick=None if interactive else self.progress(status, env))
             state = "success"
         except Aborted as e:
             sys.stderr.write(f"ABORTED: {str(e)}\n")

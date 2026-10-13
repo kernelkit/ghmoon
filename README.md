@@ -108,6 +108,12 @@ repos:
       test: |
         make O=x-gh-dl-$(echo $SHA | head -c8)-x86_64 test
 
+      # The optional progress hook is run once a minute while the
+      # tests run.  The first line it prints, if any, becomes the
+      # commit status.  Without it, the status reads "Running tests".
+      progress: |
+        tail -n1 "$TEST_LOG"
+
       # By using the builtin report hook, we can just supply some extra
       # summary information via the hook below.
       report-test-summary: |
