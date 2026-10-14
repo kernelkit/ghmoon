@@ -39,6 +39,12 @@ def deep_merge(base, overlay):
         return out
     return overlay
 
+def get_keyval(arg):
+    key, sep, val = arg.partition("=")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"\"{arg}\" is not KEY=VALUE")
+    return key, val
+
 class Aborted(Exception):
     pass
 
@@ -125,9 +131,12 @@ class GHArtifact:
         return not any(map(lambda status: status["context"] == context, statuses))
 
 class GHCommit:
-    def __init__(self, repo, sha, name=None):
+    def __init__(self, repo, sha, name=None, env=None):
         self.repo, self.sha, self.name = repo, sha, name
-        self.hook_env = os.environ | {
+
+        # Variables the job carries, e.g. to repeat an earlier run
+        self.hook_env = os.environ | { key: str(val) for key, val in (env or {}).items() }
+        self.hook_env |= {
             "GHMOON_PATH": GHMOON_PATH,
             "CONTEXT": context,
             "REPO": str(repo),
@@ -368,12 +377,12 @@ class GHRepo:
         matches = json.loads(jq.stdout)
         return [GHArtifact(self, data) for data in matches]
 
-    def process_standalone(self, sha, interactive=True):
+    def process_standalone(self, sha, interactive=True, env=None):
         for artifact in self.get_matching_artifacts():
             if artifact.sha != sha:
                 continue
 
-            job = { "sha": sha, "artifact": artifact.data }
+            job = { "sha": sha, "artifact": artifact.data, "env": env }
             return self.process(job, interactive)
 
         sys.stderr.write(f"No matching artifact for {sha} in {str(self)}\n")
@@ -382,7 +391,7 @@ class GHRepo:
     def process(self, job, interactive=True):
         sha = job["sha"]
 
-        c = GHCommit(self, sha, job.get("name"))
+        c = GHCommit(self, sha, job.get("name"), job.get("env"))
         if not c.exists():
             self.git.fetch()
 
@@ -690,6 +699,8 @@ if __name__ == "__main__":
 
     pro_sp = sps.add_parser("process")
     pro_sp.add_argument("-p", "--publish", action="store_true")
+    pro_sp.add_argument("-e", "--env", action="append", default=[], type=get_keyval,
+                        metavar="KEY=VALUE", help="Variable for the hooks (repeatable)")
     pro_sp.add_argument("repo", type=str)
     pro_sp.add_argument("sha", type=str)
 
@@ -707,7 +718,7 @@ if __name__ == "__main__":
         wq.enqueue()
     elif args.cmd == "process":
         repo_obj = repos[args.repo]
-        result = repo_obj.process_standalone(args.sha, not args.publish)
+        result = repo_obj.process_standalone(args.sha, not args.publish, dict(args.env))
         name = f"{args.repo.replace('/', '-')}-{args.sha}"
         heading = repo_obj.api(f"commits/{args.sha}")["commit"]["message"].splitlines()[0]
         candidate = f"{repo_obj.path}/report-{args.sha}.log"

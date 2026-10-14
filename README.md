@@ -130,4 +130,7 @@ to the hook logs, for whatever the hooks want to keep. Its path is in
 `$GHMOON_OUTDIR`. It is never deleted. The run id is in `$GHMOON_RUN`
 and in the job's result file.
 
+A job may carry variables for the hooks, `"env": {"SEED": "42"}` in
+its file, or `ghmoon process -e SEED=42 <repo> <sha>`.
+
 [1]: https://github.com/kernelkit/infix
