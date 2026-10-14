@@ -278,9 +278,16 @@ class GHCommit:
 
         status = local_status if interactive else self.status
 
+        # Per-run directory for the hooks, never deleted
+        run = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + os.urandom(2).hex()
+        outdir = os.path.join(self.repo.path, "out", self.sha, run)
+        os.makedirs(outdir)
+
         env = {
             "ARTIFACT": artifact["name"],
             "ARTIFACT_JSON": json.dumps(artifact),
+            "GHMOON_RUN": run,
+            "GHMOON_OUTDIR": outdir,
         }
 
         status("pending", "Deploying Artifact")
@@ -333,7 +340,7 @@ class GHCommit:
         else:
             status("error", "Internal error", gist)
 
-        return state, gist
+        return { "state": state, "gist": gist, "run": run }
 
 
 class GHRepo:
@@ -366,10 +373,11 @@ class GHRepo:
             if artifact.sha != sha:
                 continue
 
-            return self.process({ "sha": sha, "artifact": artifact.data }, interactive)
+            job = { "sha": sha, "artifact": artifact.data }
+            return self.process(job, interactive)
 
         sys.stderr.write(f"No matching artifact for {sha} in {str(self)}\n")
-        return "error", None
+        return { "state": "error" }
 
     def process(self, job, interactive=True):
         sha = job["sha"]
@@ -380,7 +388,7 @@ class GHRepo:
 
         if not c.exists():
             sys.stderr.write(f"Ignoring non-existing commit {sha} from {str(self)}\n")
-            return "error", None
+            return { "state": "error" }
 
         c.checkout()
 
@@ -414,10 +422,12 @@ class WorkQueue:
                 os.rename(os.path.join(self.paths["doing"], job),
                           os.path.join(self.paths["todo"], job))
 
-    def write_result(self, name, state, gist=None, report_log=None, error=None, heading=None):
+    def write_result(self, name, state, gist=None, run=None, report_log=None,
+                     error=None, heading=None):
         result = {
             "state": state,
             "gist": gist,
+            "run": run,
             "report_log": report_log,
             "finished_at": time.time(),
             "error": error,
@@ -559,18 +569,17 @@ class WorkQueue:
         # An abort flag left over from a previous run must not apply to this one
         self._clear_abort(name)
 
-        state, gist, error = "error", None, None
         try:
             sys.stderr.write(f"Processing {name}\n")
-            state, gist = repos[job["repo"]].process(job, not self.publish)
+            result = repos[job["repo"]].process(job, not self.publish)
             sys.stderr.write(f"Processed {name}\n")
         except Exception as e:
             sys.stderr.write(f"Aborting {name}: {str(e)}\n")
             traceback.print_exc()
-            error = str(e)
+            result = { "state": "error", "error": str(e) }
 
-        if state == "aborted":
-            error = "Aborted by user"
+        if result["state"] == "aborted":
+            result["error"] = "Aborted by user"
 
         repo_obj = repos.get(job["repo"])
         report_log = None
@@ -579,8 +588,7 @@ class WorkQueue:
             if os.path.exists(candidate):
                 report_log = candidate
 
-        self.write_result(name, state, gist=gist, report_log=report_log, error=error,
-                          heading=job.get("heading"))
+        self.write_result(name, report_log=report_log, heading=job.get("heading"), **result)
 
         # Clear an abort request that arrived too late
         self._clear_abort(name)
@@ -699,10 +707,10 @@ if __name__ == "__main__":
         wq.enqueue()
     elif args.cmd == "process":
         repo_obj = repos[args.repo]
-        state, gist = repo_obj.process_standalone(args.sha, not args.publish)
+        result = repo_obj.process_standalone(args.sha, not args.publish)
         name = f"{args.repo.replace('/', '-')}-{args.sha}"
         heading = repo_obj.api(f"commits/{args.sha}")["commit"]["message"].splitlines()[0]
         candidate = f"{repo_obj.path}/report-{args.sha}.log"
         report_log = candidate if os.path.exists(candidate) else None
-        wq.write_result(name, state, gist=gist, report_log=report_log, heading=heading)
-        sys.exit(0 if state == "success" else 1)
+        wq.write_result(name, report_log=report_log, heading=heading, **result)
+        sys.exit(0 if result["state"] == "success" else 1)

@@ -122,4 +122,12 @@ repos:
         echo **Exitcode**: $TEST_EXITCODE
 ```
 
+Runs
+----
+
+Each run of a job gets `out/<sha>/<run>/` in the repo's directory, next
+to the hook logs, for whatever the hooks want to keep. Its path is in
+`$GHMOON_OUTDIR`. It is never deleted. The run id is in `$GHMOON_RUN`
+and in the job's result file.
+
 [1]: https://github.com/kernelkit/infix

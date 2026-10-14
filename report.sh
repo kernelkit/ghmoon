@@ -28,6 +28,7 @@ cat <<EOF
 | Context  | \`$CONTEXT\` |
 | Repo     | [\`$REPO\`]($URL) |
 | Commit   | [\`$SHA8\`]($URL/commit/$SHA) |
+| Run      | \`$GHMOON_RUN\` |
 | Deploy   | $([ "$DEPLOY_EXITCODE" = 0 ] && echo :white_check_mark: Pass || echo :x: FAIL) |
 | Test     | $([ "$TEST_EXITCODE" = 0 ] && echo :white_check_mark: Pass || echo :x: FAIL) |
 EOF
